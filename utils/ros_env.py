@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import importlib
+import io
 from functools import lru_cache
-from importlib.util import find_spec
 
 
 ROS2_PYTHON_MODULES = (
@@ -19,11 +21,20 @@ def ros2_available() -> bool:
     ROS 2 Python packages are usually provided by a system ROS installation or
     a conda environment created with `ros-humble-*` packages, not by pip.
     """
-    return all(find_spec(name) is not None for name in ROS2_PYTHON_MODULES)
+    return all(_can_import(name) for name in ROS2_PYTHON_MODULES)
 
 
 def missing_ros2_modules() -> list[str]:
-    return [name for name in ROS2_PYTHON_MODULES if find_spec(name) is None]
+    return [name for name in ROS2_PYTHON_MODULES if not _can_import(name)]
+
+
+def _can_import(module_name: str) -> bool:
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            importlib.import_module(module_name)
+        return True
+    except Exception:
+        return False
 
 
 def ensure_ros2() -> None:

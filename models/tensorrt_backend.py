@@ -1,10 +1,40 @@
 from __future__ import annotations
 
+import json
+import struct
 from typing import Any
 
 import numpy as np
 
 from .base import BaseYoloModel, PredictionResult, TaskType
+from .adapters import get_adapter
+
+
+def read_ultralytics_engine_metadata(model_path: str) -> dict[str, Any]:
+    """Read the JSON metadata prefix written by Ultralytics TensorRT export."""
+    try:
+        with open(model_path, "rb") as f:
+            prefix = f.read(4)
+            if len(prefix) < 4:
+                return {}
+            metadata_len = struct.unpack("<I", prefix)[0]
+            if metadata_len <= 0 or metadata_len > 16 * 1024 * 1024:
+                return {}
+            metadata = json.loads(f.read(metadata_len).decode("utf-8"))
+            return metadata if isinstance(metadata, dict) else {}
+    except Exception:
+        return {}
+
+
+def task_from_engine_metadata(model_path: str) -> TaskType | None:
+    metadata = read_ultralytics_engine_metadata(model_path)
+    task_name = str(metadata.get("task", "")).lower()
+    if not task_name:
+        return None
+    try:
+        return TaskType(task_name)
+    except ValueError:
+        return None
 
 
 class TensorRtYoloModel(BaseYoloModel):
@@ -21,6 +51,7 @@ class TensorRtYoloModel(BaseYoloModel):
         super().__init__(model_path, task, **kwargs)
         self.device = device
         self._backend: BaseYoloModel | None = None
+        self.adapter = get_adapter(self.task)
 
     def load(self) -> None:
         try:

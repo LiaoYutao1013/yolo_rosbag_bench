@@ -14,8 +14,7 @@ try:
 except ImportError:  # pragma: no cover - allows PyQt6 fallback
     from PyQt6.QtCore import QObject, QThread, Signal
 
-from bag_reader.rosbag_reader import BagFrameGenerator, RosbagImageReader
-from bag_reader.ros_subscriber import RosImageSubscriber
+from bag_reader.ros_bridge_client import RosBridgeClient
 from metrics.performance_monitor import FrameRateMeter, LatencyTracker, SystemMonitor
 from models.base import BaseYoloModel, PredictionResult, TaskType
 from models.factory import create_model
@@ -74,8 +73,8 @@ class BagPlayerWorker(QThread):
         self.topics = topics or []
         self.realtime = realtime
         self.rate = rate
-        self._reader: Optional[RosbagImageReader] = None
-        self._generator: Optional[BagFrameGenerator] = None
+        self._client: Optional[RosBridgeClient] = None
+        self._finished_event = threading.Event()
         self._stop_requested = False
         self._pause_requested = False
         self._seek_requested: Optional[float] = None
@@ -83,95 +82,80 @@ class BagPlayerWorker(QThread):
 
     def stop(self) -> None:
         self._stop_requested = True
-        if self._generator is not None:
-            self._generator.stop()
+        if self._client is not None:
+            self._client.stop()
 
     def pause(self) -> None:
         self._pause_requested = True
-        if self._generator is not None:
-            self._generator.pause()
+        if self._client is not None:
+            self._client.pause()
 
     def resume(self) -> None:
         self._pause_requested = False
-        if self._generator is not None:
-            self._generator.resume()
+        if self._client is not None:
+            self._client.resume()
 
     def set_rate(self, rate: float) -> None:
         self._rate = max(0.05, rate)
-        if self._generator is not None:
-            self._generator.rate = self._rate
+        if self._client is not None:
+            self._client.set_rate(self._rate)
 
     def seek(self, ratio: float) -> None:
         self._seek_requested = min(1.0, max(0.0, ratio))
-        if self._generator is not None:
-            self._generator.stop()
+        if self._client is not None:
+            self._client.seek(self._seek_requested)
 
     def run(self) -> None:
+        self._finished_event.clear()
+        client = RosBridgeClient(
+            on_frame=self._handle_bridge_frame,
+            on_progress=lambda ratio: self.progress_changed.emit(ratio),
+            on_status=lambda message: self.status.emit(message),
+            on_error=self._handle_bridge_error,
+            on_finished=self._finished_event.set,
+        )
+        self._client = client
         try:
-            while not self._stop_requested:
-                self.status.emit("Opening bag...")
-                if self._reader is not None:
-                    self._reader.close()
-                reader = RosbagImageReader(self.bag_path, self.topics)
-                reader.scan(should_stop=lambda: self._stop_requested)
-                self._reader = reader
-                if self._stop_requested:
-                    reader.close()
+            self.status.emit("Starting ROS bridge process...")
+            client.start()
+            client.open_bag(self.bag_path, self.topics, self.realtime, self._rate)
+            if self._pause_requested:
+                client.pause()
+            if self._seek_requested is not None:
+                client.seek(self._seek_requested)
+                self._seek_requested = None
+            while not self._stop_requested and not self._finished_event.wait(0.1):
+                if not client.is_running:
+                    detail = client.stderr_text.strip()
+                    message = "ROS bridge process exited unexpectedly"
+                    if detail:
+                        message += f"\n{detail}"
+                    self.error.emit(message)
                     break
-                if reader._total_frames:
-                    self.status.emit(f"Playing {reader._total_frames} frames")
-                else:
-                    self.status.emit("No frames found")
-                    self.error.emit("No image frames were found in the selected bag")
-                    return
-
-                if self._seek_requested is not None:
-                    reader.seek_ratio(self._seek_requested)
-                    self._seek_requested = None
-
-                generator = BagFrameGenerator(
-                    reader,
-                    realtime=self.realtime,
-                    rate=self._rate,
-                    on_frame=self._handle_bag_frame,
-                )
-                self._generator = generator
-                if self._pause_requested:
-                    generator.pause()
-                generator.run()
-                self._generator = None
-
-                if self._stop_requested:
-                    break
-                if self._seek_requested is not None:
-                    continue
-                break
         except Exception as exc:  # noqa: BLE001
             logger.exception("Bag player failed")
             self.error.emit(str(exc))
         finally:
-            try:
-                if self._reader is not None:
-                    self._reader.close()
-            finally:
-                self.finished.emit()
+            client.close()
+            self._client = None
+            self.finished.emit()
 
-    def _handle_bag_frame(self, bag_frame: Any) -> None:
-        if bag_frame is None:
-            return
+    def _handle_bridge_frame(self, timestamp_ns: int, topic: str, frame: np.ndarray) -> None:
         if self._stop_requested:
             return
         try:
             self.frame_queue.put(
-                (bag_frame.timestamp_ns, bag_frame.topic, bag_frame.frame),
+                (timestamp_ns, topic, frame),
                 timeout=0.5,
             )
         except queue.Full:
             logger.warning("Frame queue is full; dropping bag frame")
-        if self._reader is not None and self._reader._total_frames:
-            ratio = min(1.0, max(0.0, self._reader._frame_index / self._reader._total_frames))
-            self.progress_changed.emit(ratio)
-        self.frame_ready.emit((bag_frame.timestamp_ns, bag_frame.topic, bag_frame.frame))
+        self.frame_ready.emit((timestamp_ns, topic, frame))
+
+    def _handle_bridge_error(self, message: str) -> None:
+        if not self._stop_requested:
+            self.error.emit(message)
+        self._finished_event.set()
 
 
 class InferenceWorker(QThread):
@@ -253,9 +237,7 @@ class InferenceWorker(QThread):
                 self._frame_index += 1
                 start = time.monotonic()
                 result = model.predict(frame)
-                from models.adapters import get_adapter
-
-                rendered = get_adapter(self.task).render(result)
+                rendered = model.adapter.render(result)
                 wall_ms = (time.monotonic() - start) * 1000.0
                 latency = result.timing.total_ms if result.timing.total_ms > 0 else wall_ms
                 fps = self._fps_meter.update()
@@ -292,6 +274,7 @@ class RosSubscriberWorker(QThread):
     frame_ready = Signal(object)
     error = Signal(str)
     status = Signal(str)
+    finished = Signal()
 
     def __init__(
         self,
@@ -306,38 +289,64 @@ class RosSubscriberWorker(QThread):
         self.frame_queue = frame_queue
         self.qos_depth = qos_depth
         self.best_effort = best_effort
-        self._subscriber: Optional[RosImageSubscriber] = None
+        self._client: Optional[RosBridgeClient] = None
+        self._finished_event = threading.Event()
         self._stop_requested = False
 
     def stop(self) -> None:
         self._stop_requested = True
+        if self._client is not None:
+            self._client.stop()
 
     def run(self) -> None:
+        self._finished_event.clear()
+        client = RosBridgeClient(
+            on_frame=self._handle_bridge_frame,
+            on_status=lambda message: self.status.emit(message),
+            on_error=self._handle_bridge_error,
+            on_finished=self._finished_event.set,
+        )
+        self._client = client
         try:
             self.status.emit(f"Subscribing to {self.topic}...")
-            subscriber = RosImageSubscriber(
-                topic=self.topic,
-                frame_queue=self.frame_queue,
-                qos_depth=self.qos_depth,
-                node_name="yolo_bench_subscriber",
-                use_best_effort=self.best_effort,
-            )
-            self._subscriber = subscriber
-            subscriber.start()
-            while not self._stop_requested:
-                if not subscriber.is_alive():
-                    if subscriber.last_error:
-                        self.error.emit(subscriber.last_error)
+            client.start()
+            client.subscribe(self.topic, self.qos_depth, self.best_effort)
+            while not self._stop_requested and not self._finished_event.wait(0.1):
+                if not client.is_running:
+                    detail = client.stderr_text.strip()
+                    message = "ROS bridge process exited unexpectedly"
+                    if detail:
+                        message += f"\n{detail}"
+                    self.error.emit(message)
                     break
-                time.sleep(0.1)
-            subscriber.stop()
         except Exception as exc:  # noqa: BLE001
             logger.exception("ROS subscriber worker failed")
             self.error.emit(str(exc))
         finally:
-            if self._subscriber is not None:
-                self._subscriber.stop()
+            client.close()
+            self._client = None
             self.finished.emit()
+
+    def _handle_bridge_frame(self, timestamp_ns: int, topic: str, frame: np.ndarray) -> None:
+        if self._stop_requested:
+            return
+        try:
+            self.frame_queue.put_nowait((timestamp_ns, topic, frame))
+        except queue.Full:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.frame_queue.put_nowait((timestamp_ns, topic, frame))
+            except queue.Full:
+                pass
+        self.frame_ready.emit((timestamp_ns, topic, frame))
+
+    def _handle_bridge_error(self, message: str) -> None:
+        if not self._stop_requested:
+            self.error.emit(message)
+        self._finished_event.set()
 
 
 class SystemMonitorWorker(QThread):

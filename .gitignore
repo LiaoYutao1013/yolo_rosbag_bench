@@ -1,5 +1,42 @@
 __pycache__/
 *.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Virtual environments
 .venv/
-results/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Build outputs
+build/
+dist/
+*.so
+*.dll
+*.dylib
+
+# Logs
 *.log
+
+# Results / generated outputs
+results/
+outputs/
+artifacts/
+
+# Model checkpoints / exports
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.plan
+*.torchscript

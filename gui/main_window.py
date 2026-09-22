@@ -58,10 +58,11 @@ except ImportError:  # pragma: no cover
 
 from metrics.performance_monitor import SystemSample
 from models.base import TaskType
+from models.tensorrt_backend import task_from_engine_metadata
 from utils.config import AppConfig
 from utils.exporters import export_records, export_results
 from utils.logger import setup_logger
-from utils.ros_env import ensure_ros2
+from utils.model_metrics import load_dynamic_model_metrics
 from utils.training_metrics import parse_ultralytics_results_csv
 
 from .plot_panel import PlotPanel
@@ -95,6 +96,8 @@ class MainWindow(QMainWindow):
         self.validation_worker: Optional[ValidationWorker] = None
         self._paused = False
         self._started_at = time.monotonic()
+        self._last_video_display_at = 0.0
+        self._video_display_interval = 1.0 / 15.0
         self._build_ui()
         self._connect_signals()
 
@@ -109,7 +112,12 @@ class MainWindow(QMainWindow):
         self.video_panel = VideoPanel()
         splitter.addWidget(self.video_panel)
         self.plot_panel = PlotPanel()
-        splitter.addWidget(self.plot_panel)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.plot_panel, 1)
+        right_layout.addWidget(self._make_model_metrics_table(), 0)
+        splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 1)
@@ -266,8 +274,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.metrics_table)
         return panel
 
+    def _make_model_metrics_table(self) -> QWidget:
+        panel = QGroupBox("Imported model metrics")
+        layout = QVBoxLayout(panel)
+        table = QTableWidget(0, 2)
+        table.setHorizontalHeaderLabels(["Metric", "Value"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.setMinimumHeight(150)
+        table.setMaximumHeight(230)
+        layout.addWidget(table)
+        self.model_metrics_table = table
+        return panel
+
     def _connect_signals(self) -> None:
         self.source_combo.currentIndexChanged.connect(self._update_source_state)
+        self.model_edit.textChanged.connect(self._refresh_model_metrics)
         self.start_btn.clicked.connect(self._start)
         self.pause_btn.clicked.connect(self._toggle_pause)
         self.stop_btn.clicked.connect(self._stop)
@@ -276,6 +299,7 @@ class MainWindow(QMainWindow):
         self.export_json_btn.clicked.connect(lambda: self._export("json"))
         self.load_train_btn.clicked.connect(self._load_training_csv)
         self.progress_slider.valueChanged.connect(self._on_slider_moved)
+        self.rate_spin.valueChanged.connect(self._on_rate_changed)
         self._update_source_state()
 
     # -------------------------------------------------------------- actions
@@ -292,6 +316,39 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Select model", "", "Model (*.pt *.onnx *.engine);;All files (*)")
         if path:
             self.model_edit.setText(path)
+
+    def _refresh_model_metrics(self, model_path: str) -> None:
+        if model_path.strip().lower().endswith(".engine"):
+            detected_task = task_from_engine_metadata(model_path.strip())
+            if detected_task is not None:
+                index = self.task_combo.findData(detected_task)
+                if index >= 0:
+                    self.task_combo.setCurrentIndex(index)
+        metrics = load_dynamic_model_metrics(model_path.strip())
+        self.model_metrics_table.setRowCount(0)
+        if not metrics:
+            self.model_metrics_table.setRowCount(1)
+            self.model_metrics_table.setItem(0, 0, QTableWidgetItem("提示"))
+            self.model_metrics_table.setItem(0, 1, QTableWidgetItem("未匹配到训练结果文件"))
+            return
+        preferred = [
+            "mAP50",
+            "mAP50-95",
+            "precision",
+            "recall",
+            "参数量(M)",
+            "GFLOPs",
+            "Batchsize",
+            "workers",
+            "Epochs",
+            "配置",
+            "iou_loss",
+        ]
+        ordered = [(key, metrics[key]) for key in preferred if key in metrics]
+        self.model_metrics_table.setRowCount(len(ordered))
+        for row, (key, value) in enumerate(ordered):
+            self.model_metrics_table.setItem(row, 0, QTableWidgetItem(str(key)))
+            self.model_metrics_table.setItem(row, 1, QTableWidgetItem(str(value)))
 
     def _browse_bag(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select rosbag", "", "ROS 2 bag (*.db3 *.mcap);;All files (*)")
@@ -348,11 +405,6 @@ class MainWindow(QMainWindow):
     def _start(self) -> None:
         config = self._collect_config()
         if config is None:
-            return
-        try:
-            ensure_ros2()
-        except RuntimeError as exc:
-            QMessageBox.warning(self, "ROS 2 unavailable", str(exc))
             return
         self._stop_workers()
         if any(
@@ -481,6 +533,10 @@ class MainWindow(QMainWindow):
             self.player_worker.seek(value / 1000.0)
             self.progress_label.setText(f"Progress: seeking {value / 10.0:.1f}%")
 
+    def _on_rate_changed(self, value: float) -> None:
+        if self.player_worker is not None:
+            self.player_worker.set_rate(float(value))
+
     def _run_validation(self) -> None:
         config = self._collect_config(require_source=False)
         if config is None:
@@ -526,9 +582,9 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- slots
     def _on_model_loaded(self, path: str) -> None:
         self.statusBar().showMessage(f"Model loaded: {path}")
+        self._refresh_model_metrics(path)
 
     def _on_frame_processed(self, payload: InferenceFrame) -> None:
-        self.video_panel.show_raw(payload.raw)
         count = int(len(payload.result.boxes))
         info = (
             f"{payload.topic}\n"
@@ -536,7 +592,15 @@ class MainWindow(QMainWindow):
             f"jitter={payload.jitter_ms:.1f}ms  CPU={payload.system.get('cpu_percent', 0):.0f}% "
             f"GPU={payload.system.get('gpu_util', 0):.0f}%"
         )
-        self.video_panel.show_result(payload.rendered, info)
+        now = time.monotonic()
+        if now - self._last_video_display_at >= self._video_display_interval:
+            self.video_panel.show_pair(
+                payload.raw,
+                payload.rendered,
+                info,
+                keypoints=payload.result.keypoints,
+            )
+            self._last_video_display_at = now
         elapsed = time.monotonic() - self._started_at
         self.plot_panel.update(elapsed, payload.fps, payload.latency_ms, payload.system)
         self.records.append(payload.as_record())

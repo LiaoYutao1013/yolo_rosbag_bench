@@ -58,7 +58,7 @@ class RosbagImageReader:
         try:
             from rclpy.serialization import deserialize_message
             from rosbag2_py import ConverterOptions, SequentialReader, StorageFilter, StorageOptions
-            from sensor_msgs.msg import Image
+            from sensor_msgs.msg import CompressedImage, Image
         except ImportError as exc:
             raise RuntimeError("ROS 2 Python packages could not be imported") from exc
 
@@ -73,17 +73,26 @@ class RosbagImageReader:
             meta.name: meta.type
             for meta in reader.get_all_topics_and_types()
         }
-        image_topics = [t for t, msg_type in topic_types.items() if msg_type.endswith("/msg/Image")]
+        image_topics = [
+            t
+            for t, msg_type in topic_types.items()
+            if msg_type.endswith("/msg/Image") or msg_type.endswith("/msg/CompressedImage")
+        ]
         if self.topic_filter:
-            requested = [t for t in image_topics if any(t == f or t.endswith(f) for f in self.topic_filter)]
+            requested = [
+                t
+                for t in image_topics
+                if any(self._topic_matches(t, f) for f in self.topic_filter)
+            ]
             if requested:
                 image_topics = requested
         if not image_topics:
-            raise ValueError("No sensor_msgs/msg/Image topic found in bag")
+            raise ValueError("No sensor_msgs/msg/Image or CompressedImage topic found in bag")
 
         reader.set_filter(StorageFilter(topics=image_topics))
         self._reader = reader
         self._storage_filter = StorageFilter(topics=image_topics)
+        self.image_topics = list(image_topics)
         self._closed = False
         self._frame_count = 0
         self._duration_s = 0.0
@@ -91,6 +100,8 @@ class RosbagImageReader:
         self._frame_index = 0
         self._deserialize_message = deserialize_message
         self._Image = Image
+        self._CompressedImage = CompressedImage
+        self._topic_types = topic_types
 
     def scan(self, should_stop: Optional[Callable[[], bool]] = None) -> None:
         """Count frames and total duration once, then reopen the bag.
@@ -111,8 +122,12 @@ class RosbagImageReader:
                     break
                 if not self._reader.has_next():
                     break
-                _, data, _ = self._reader.read_next()
-                msg = self._deserialize_message(data, self._Image)
+                topic, data, _ = self._reader.read_next()
+                msg_type = self._topic_types.get(topic, "")
+                if msg_type.endswith("/CompressedImage"):
+                    msg = self._deserialize_message(data, self._CompressedImage)
+                else:
+                    msg = self._deserialize_message(data, self._Image)
                 ts_s = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
                 if start_s is None:
                     start_s = ts_s
@@ -138,6 +153,16 @@ class RosbagImageReader:
         # Empty string lets rosbag2 auto-detect the installed storage plugin.
         return ""
 
+    @staticmethod
+    def _topic_matches(topic: str, pattern: str) -> bool:
+        base = topic[: -len("/compressed")] if topic.endswith("/compressed") else topic
+        return (
+            topic == pattern
+            or base == pattern
+            or topic.endswith(pattern)
+            or base.endswith(pattern)
+        )
+
     def iter_frames(self) -> Iterator[BagFrame]:
         if self._reader is None:
             self.open()
@@ -148,8 +173,13 @@ class RosbagImageReader:
                     self._frame_index += 1
                     continue
                 self._frame_index += 1
-                msg = self._deserialize_message(data, self._Image)
-                frame = self.image_to_bgr(msg)
+                msg_type = self._topic_types.get(topic, "")
+                if msg_type.endswith("/CompressedImage"):
+                    msg = self._deserialize_message(data, self._CompressedImage)
+                    frame = self.compressed_to_bgr(msg)
+                else:
+                    msg = self._deserialize_message(data, self._Image)
+                    frame = self.image_to_bgr(msg)
                 if frame is None:
                     continue
                 ts_s = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
@@ -223,6 +253,16 @@ class RosbagImageReader:
         if arr.ndim == 2:
             arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
         return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def compressed_to_bgr(msg: Any) -> Optional[np.ndarray]:
+        """Decode a ROS CompressedImage message into BGR."""
+        try:
+            encoded = np.frombuffer(msg.data, dtype=np.uint8)
+            frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            return np.ascontiguousarray(frame) if frame is not None else None
+        except Exception:
+            return None
 
     @staticmethod
     def _decode_row_stride(msg: Any, dtype: Any, channels: int) -> np.ndarray:

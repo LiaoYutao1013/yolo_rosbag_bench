@@ -5,11 +5,31 @@ import numpy as np
 try:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPixmap
-    from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+    from PySide6.QtWidgets import (
+        QAbstractItemView,
+        QFrame,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QTableWidget,
+        QTableWidgetItem,
+        QVBoxLayout,
+        QWidget,
+    )
 except ImportError:  # pragma: no cover
     from PyQt6.QtCore import Qt
     from PyQt6.QtGui import QPixmap
-    from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+    from PyQt6.QtWidgets import (
+        QAbstractItemView,
+        QFrame,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QTableWidget,
+        QTableWidgetItem,
+        QVBoxLayout,
+        QWidget,
+    )
 
 from utils.image_utils import safe_qimage
 
@@ -23,6 +43,7 @@ class VideoPanel(QWidget):
         self.result_label = self._make_label("YOLO result")
         self.raw_info = QLabel("Waiting for frames...")
         self.result_info = QLabel("Waiting for inference...")
+        self.keypoint_table = self._make_keypoint_table()
         self.raw_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.result_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -32,6 +53,7 @@ class VideoPanel(QWidget):
         result_col = QVBoxLayout()
         result_col.addWidget(self.result_label, 1)
         result_col.addWidget(self.result_info)
+        result_col.addWidget(self.keypoint_table, 0)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -46,6 +68,18 @@ class VideoPanel(QWidget):
         label.setScaledContents(False)
         return label
 
+    def _make_keypoint_table(self) -> QTableWidget:
+        table = QTableWidget(0, 1)
+        table.setHorizontalHeaderLabels(["Keypoint confidence"])
+        table.setMaximumHeight(120)
+        table.setMinimumHeight(50)
+        table.setVisible(False)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        return table
+
     def show_raw(self, frame: np.ndarray) -> None:
         self._set_image(self.raw_label, frame)
 
@@ -53,6 +87,53 @@ class VideoPanel(QWidget):
         self._set_image(self.result_label, frame)
         if info:
             self.result_info.setText(info)
+
+    def show_pair(
+        self,
+        raw: np.ndarray,
+        result: np.ndarray,
+        info: str | None = None,
+        keypoints: np.ndarray | None = None,
+    ) -> None:
+        """Atomically refresh both panels in one GUI slot to avoid partial flicker."""
+        self._set_image(self.raw_label, raw)
+        self._set_image(self.result_label, result)
+        if info:
+            self.result_info.setText(info)
+        self._update_keypoints(keypoints)
+
+    def _update_keypoints(self, keypoints: np.ndarray | None) -> None:
+        if keypoints is None or len(keypoints) == 0:
+            self.keypoint_table.setVisible(False)
+            self.keypoint_table.clearContents()
+            self.keypoint_table.setRowCount(0)
+            return
+        if keypoints.ndim != 3:
+            self.keypoint_table.setVisible(False)
+            return
+        num_people = keypoints.shape[0]
+        num_keypoints = keypoints.shape[1]
+        if num_people == 0 or num_keypoints == 0:
+            self.keypoint_table.setVisible(False)
+            return
+
+        headers = ["Person"] + [f"KP{i}" for i in range(num_keypoints)]
+        self.keypoint_table.setColumnCount(len(headers))
+        self.keypoint_table.setHorizontalHeaderLabels(headers)
+        self.keypoint_table.setRowCount(num_people)
+        for person_idx, person in enumerate(keypoints):
+            person_item = QTableWidgetItem(f"P{person_idx + 1}")
+            self.keypoint_table.setItem(person_idx, 0, person_item)
+            for kp_idx, kp in enumerate(person):
+                conf = float(kp[2]) if len(kp) > 2 else 0.0
+                item = QTableWidgetItem(f"{conf:.2f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.keypoint_table.setItem(person_idx, kp_idx + 1, item)
+        self.keypoint_table.resizeColumnsToContents()
+        self.keypoint_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, num_keypoints + 1):
+            self.keypoint_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self.keypoint_table.setVisible(True)
 
     def _set_image(self, label: QLabel, frame: np.ndarray) -> None:
         if frame is None:
@@ -77,3 +158,6 @@ class VideoPanel(QWidget):
         self.result_label.setText("YOLO result")
         self.raw_info.setText("Waiting for frames...")
         self.result_info.setText("Waiting for inference...")
+        self.keypoint_table.setVisible(False)
+        self.keypoint_table.clearContents()
+        self.keypoint_table.setRowCount(0)
